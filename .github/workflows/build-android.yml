@@ -26,8 +26,9 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      # 关键修改：跳过了安装 SDK 的步骤，直接手动接受许可
+      - name: Accept Android SDK Licenses
+        run: echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
       - name: Cache debug keystore
         uses: actions/cache@v4
