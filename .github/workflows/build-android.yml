@@ -15,10 +15,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: 'pnpm'
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -26,7 +32,6 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      # 关键修改：跳过了安装 SDK 的步骤，直接手动接受许可
       - name: Accept Android SDK Licenses
         run: echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
@@ -37,10 +42,10 @@ jobs:
           key: android-debug-keystore
 
       - name: Install dependencies
-        run: npm install
+        run: pnpm install
 
       - name: Build web
-        run: npm run build
+        run: pnpm run build
 
       - name: Add/Sync Android
         run: |
