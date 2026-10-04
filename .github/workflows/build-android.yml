@@ -15,16 +15,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'pnpm'
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -42,10 +36,10 @@ jobs:
           key: android-debug-keystore
 
       - name: Install dependencies
-        run: pnpm install
+        run: npm install
 
       - name: Build web
-        run: pnpm run build
+        run: npm run build
 
       - name: Add/Sync Android
         run: |
