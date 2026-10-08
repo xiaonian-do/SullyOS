@@ -143,6 +143,7 @@ describe('排程任务的凭据', () => {
 
     expect(putRows()).toEqual([{
       credId: `char:${CHAR_ID}/chat`,
+      owner: { type: 'character', id: CHAR_ID }, ownerGeneration: 0,
       value: {
         apiUrl: 'https://api.example.dev/v1/chat/completions',
         apiKey: 'sk-global',
@@ -290,6 +291,13 @@ describe('即时对话的凭据与情绪评估', () => {
     });
   });
 
+  it('秘密请求编号随加密评估配置保留，凭据引用仍不携带副 API key', async () => {
+    await send({emotionEval: {...EVAL_SPEC, homeSecretRequestId: 'secret-request'}});
+    expect(scheduledTask().metadata.amsgEmotionEval).toEqual({
+      prompt: EVAL_SPEC.prompt, homeSecretRequestId: 'secret-request',
+    });
+  });
+
   it('这一轮不评估 → 只带聊天那个引用（绝不出现单挂 emotion 的空壳）', async () => {
     await send();
 
@@ -326,6 +334,7 @@ describe('即时对话的凭据与情绪评估', () => {
     const credBody = capturedPayloads.find((p) => p && 'credentials' in p);
     expect(credBody.credentials).toEqual([{
       credId: `char:${CHAR_ID}/instant`,
+      owner: { type: 'character', id: CHAR_ID }, ownerGeneration: 0,
       value: {
         apiUrl: 'https://api.example.dev/v1/chat/completions',
         apiKey: 'sk-global',

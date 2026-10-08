@@ -1,9 +1,14 @@
 import { readLocalCursor } from './localRead';
+import { reportDatabaseFailure } from './databaseHealth';
+import { recordDatabaseOpen } from './databaseOpenDiagnostics';
 import {migrateLegacyWhiteboxPresets} from './legacyWhiteboxPresets';
 import {restoreDecorationMedia} from './decorationMediaBackup';
 import {exportBeautyPreferences,importBeautyPreferences} from './beautyPreferencesBackup';
 import {exportBeautyAuthorBackup,importBeautyAuthorBackup} from './beautyAuthorBackup';
 import { toMountedWorldbook } from './worldbook';
+import { persistCharacterWithHomeMessages } from './homeMessageBridge';
+import {deleteSecretNotesForIds, announceSecretNotesChanged} from './secretNote';
+
 import { orderWorldEpisodes } from './worldHome/episodeOrder';
 
 
@@ -23,6 +28,7 @@ import { exportSignalLocal, importSignalLocal } from './vrWorld/signal';
 import { exportLuckinLocal, importLuckinLocal } from './luckinMcpClient';
 import { exportMcdLocal, importMcdLocal } from './mcdMcpClient';
 import { exportMcpLocal, importMcpLocal } from './mcpClient';
+import { exportHome3DLocal, importHome3DLocal, HOME3D_LOCAL_KEYS } from './home3DBackup';
 import { exportAmsg2GlobalConfig, importAmsg2GlobalConfig } from './activeMsgStore';
 import { exportWorldHomeLocal, importWorldHomeLocal } from './worldHome/localBackup';
 import { exportDesktopSkinLocal, importDesktopSkinLocal } from './desktopSkinBackup';
@@ -35,8 +41,10 @@ const DB_NAME = 'AetherOS_Data';
 // v69：见面·剧情条目与糯米机原生预设。正文继续复用 messages 表，避免再造会话存储。
 // v70：剧场面具箱（原创人物面具）；角色面具仍只存 characterId，不复制神经链接资料。
 // v71：角色小红书伪主页；发帖归属与可删除的自由活动日志分离。
-// v72: 回执按角色与 deliveryId 查重，不在写事务中扫描整段聊天、阻塞资源读取。
-const DB_VERSION = 72;
+// v72: home projection reads only home-source rows, never scans private-chat history.
+// v73: direct home-turn lookups for incremental journal writes.
+// v74: merge master delivery lookup with both home indexes, including existing v73 databases.
+const DB_VERSION = 74;
 
 const STORE_CHARACTERS = 'characters';
 const STORE_CHAR_GROUPS = 'character_groups'; // 角色分组定义（角色通过 groupId 指向；与群聊 groups 无关）
@@ -144,6 +152,7 @@ export const openDB = (): Promise<IDBDatabase> => {
   if (dbPromise) return dbPromise;
 
   const promise = new Promise<IDBDatabase>((resolve, reject) => {
+    recordDatabaseOpen('open-requested', { requestedVersion: DB_VERSION });
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     // onblocked 不是终态: 它先 reject, 但底层 open request 还活着, 等占用方关闭后仍会
     // 触发 onsuccess。用 settled 标记 promise 已 settle, 让那条迟到的连接被 close 掉而
@@ -152,6 +161,7 @@ export const openDB = (): Promise<IDBDatabase> => {
     // 重开并缓存了新 promise, 陈旧连接的回调不能误清新单例 (否则又凭空多开一条连接)。
     let settled = false;
     const openTimer = setTimeout(() => {
+        recordDatabaseOpen('open-timeout', { requestedVersion: DB_VERSION });
         settled = true;
         if (dbPromise === promise) dbPromise = null;
         reject(new Error('本地数据库连接超时，请关闭其他糯米机页面后重试；无需清理数据'));
@@ -168,6 +178,7 @@ export const openDB = (): Promise<IDBDatabase> => {
         // 只是当前 schema 的超集, 不带版本号打开就能连到现有版本、读写完全兼容,
         // 不需要也不能降级建表。所以这里回退到「不带版本号 open」一次而不是报死。
         if (err?.name === 'VersionError') {
+            recordDatabaseOpen('versionless-fallback', { requestedVersion: DB_VERSION });
             console.warn('[DB] open VersionError —— 现有版本高于当前 build, 回退到不带版本号打开');
             // Keep the timeout active until the versionless request settles.
             // 原 request 已终结 (VersionError 后不会再 onsuccess)，由 fallback 负责结算。
@@ -176,6 +187,7 @@ export const openDB = (): Promise<IDBDatabase> => {
                 const db = fb.result;
                 if (settled) { db.close(); return; }
                 clearTimeout(openTimer);
+                recordDatabaseOpen('open-ready', { requestedVersion: DB_VERSION, actualVersion: db.version });
                 // 与正常路径一致地挂上失效自愈回调 (另一 tab 升级 / 浏览器强关连接)。
                 db.onversionchange = () => {
                     db.close();
@@ -187,7 +199,9 @@ export const openDB = (): Promise<IDBDatabase> => {
                 resolve(db);
             };
             fb.onerror = () => {
+                if (settled) return;
                 clearTimeout(openTimer);
+                recordDatabaseOpen('open-error', { requestedVersion: DB_VERSION });
                 settled = true;
                 console.error("DB Open Error (versionless fallback):", fb.error);
                 if (dbPromise === promise) dbPromise = null;
@@ -196,6 +210,7 @@ export const openDB = (): Promise<IDBDatabase> => {
             return;
         }
         clearTimeout(openTimer);
+        recordDatabaseOpen('open-error', { requestedVersion: DB_VERSION });
         console.error("DB Open Error:", err);
         if (dbPromise === promise) dbPromise = null; // 打开失败别把 rejected promise 缓存住
         settled = true;
@@ -211,9 +226,11 @@ export const openDB = (): Promise<IDBDatabase> => {
             try { db.close(); } catch { /* ignore */ }
             return;
         }
+        recordDatabaseOpen('open-ready', { requestedVersion: DB_VERSION, actualVersion: db.version });
         // 另一个 tab 触发版本升级时必须主动 close 让位, 否则对方 open 会被 block;
         // 顺手清缓存, 下次 openDB 重开到新版本。
         db.onversionchange = () => {
+            recordDatabaseOpen('version-change', { requestedVersion: DB_VERSION, actualVersion: db.version });
             db.close();
             if (dbPromise === promise) dbPromise = null;
         };
@@ -228,6 +245,7 @@ export const openDB = (): Promise<IDBDatabase> => {
         // 的竞态会让 push 静默丢失 → 主线程超时, 所以那边 (worker/sw-keep-alive.ts 的
         // withInboxTx) 单独补了「InvalidStateError 清缓存重开一次」的事务级兜底。
         db.onclose = () => {
+            recordDatabaseOpen('connection-closed', { requestedVersion: DB_VERSION, actualVersion: db.version });
             if (dbPromise === promise) dbPromise = null;
         };
         resolve(db);
@@ -235,6 +253,7 @@ export const openDB = (): Promise<IDBDatabase> => {
 
     request.onblocked = () => {
         clearTimeout(openTimer);
+        recordDatabaseOpen('open-blocked', { requestedVersion: DB_VERSION });
         // 另一个 tab 仍持有旧版本连接, 升级被挡。清缓存 + reject, 别让调用方无限挂着;
         // 与 activeMsgStore / sw-keep-alive 的 openDB 一致, 对方 tab 关闭后下次调用可重试。
         console.warn('[DB] open blocked —— 另一个 tab 仍持有旧版本连接未关闭');
@@ -247,6 +266,10 @@ export const openDB = (): Promise<IDBDatabase> => {
       // A legitimate schema migration may be slow; never cancel it halfway.
       clearTimeout(openTimer);
       const db = (event.target as IDBOpenDBRequest).result;
+      const upgradeVersions = { requestedVersion: DB_VERSION, fromVersion: event.oldVersion, actualVersion: db.version };
+      recordDatabaseOpen('upgrade-started', upgradeVersions);
+      request.transaction!.addEventListener('complete', () => recordDatabaseOpen('upgrade-committed', upgradeVersions));
+      request.transaction!.addEventListener('abort', () => recordDatabaseOpen('upgrade-aborted', upgradeVersions));
 
       const createStore = (name: string, options?: IDBObjectStoreParameters) => {
           if (!db.objectStoreNames.contains(name)) {
@@ -279,6 +302,15 @@ export const openDB = (): Promise<IDBDatabase> => {
               msgStore.createIndex('charId_type', ['charId', 'type'], { unique: false });
           }
       } catch (e) { console.log('charId_type index migration skipped', e); }
+
+      const messageStore = (event.target as IDBOpenDBRequest).transaction!.objectStore(STORE_MESSAGES);
+      if (!messageStore.indexNames.contains('charId_source')) {
+          messageStore.createIndex('charId_source', ['charId', 'metadata.source'], { unique: false });
+      }
+
+      if (!messageStore.indexNames.contains('charId_homeTurn')) {
+          messageStore.createIndex('charId_homeTurn', ['charId', 'metadata.homeTurnId'], { unique: false });
+      }
 
       const deliveryStore = (event.target as IDBOpenDBRequest).transaction!.objectStore(STORE_MESSAGES);
       if (!deliveryStore.indexNames.contains('charId_deliveryId')) {
@@ -515,6 +547,8 @@ export const openDB = (): Promise<IDBDatabase> => {
   });
 
   dbPromise = promise;
+  // Notify the app guard even when a background caller catches the rejection.
+  void promise.catch(reportDatabaseFailure);
   return promise;
 };
 
@@ -576,14 +610,30 @@ export const DB = {
 
   saveCharacter: async (character: CharacterProfile): Promise<void> => {
     const db = await openDB();
-    // 等事务真正提交再 resolve —— 否则调用方 await 后立刻重读 DB 会拿到旧值 (情绪 buff 落库竞态根因).
+    return persistCharacterWithHomeMessages(db, character, clearStaleMemoryMirror);
+  },
+
+  /** An asynchronous evaluation updates only emotion fields, never its stale home/history snapshot. */
+  saveCharacterEmotion: async (charId: string, activeBuffs: CharacterProfile['activeBuffs'], buffInjection: string): Promise<void> => {
+    const db = await openDB();
     return new Promise((resolve, reject) => {
-      const transaction = db.transaction(STORE_CHARACTERS, 'readwrite');
-      transaction.objectStore(STORE_CHARACTERS).put(character);
-      transaction.oncomplete = () => resolve();
-      transaction.onerror = () => reject(transaction.error);
-      transaction.onabort = () => reject(transaction.error || new Error('saveCharacter aborted'));
+      const tx = db.transaction(STORE_CHARACTERS, 'readwrite');
+      const store = tx.objectStore(STORE_CHARACTERS), get = store.get(charId);
+      get.onsuccess = () => {if (get.result) store.put({...get.result, activeBuffs, buffInjection});};
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error('情绪保存失败'));
     });
+  },
+
+  ensureHomeContextMessages: async (charId: string): Promise<void> => {
+    const db = await openDB();
+    const migrated = await new Promise<boolean>((resolve, reject) => {
+      const request = db.transaction(STORE_CHARACTERS, 'readonly').objectStore(STORE_CHARACTERS).get(charId);
+      request.onsuccess = () => resolve(!request.result || request.result.homeContextBridgeVersion === 3);
+      request.onerror = () => reject(request.error);
+    });
+    if (!migrated) await persistCharacterWithHomeMessages(db, charId, clearStaleMemoryMirror);
   },
 
   deleteCharacter: async (id: string): Promise<void> => {
@@ -636,15 +686,24 @@ export const DB = {
    * @param includeProcessed 是否包含已被记忆宫殿处理的消息（默认 false，即自动过滤）。
    *                         记忆归档、批量总结等需要完整历史的场景应传 true。
    */
-  getMessagesByCharId: async (charId: string, includeProcessed: boolean = false): Promise<Message[]> => {
+  getMessagesByCharId: async (charId: string, includeProcessed: boolean = false, sealHomeActions: boolean = false): Promise<Message[]> => {
     const db = await openDB();
     return new Promise((resolve, reject) => {
-      const transaction = db.transaction(STORE_MESSAGES, 'readonly');
+      const transaction = db.transaction(STORE_MESSAGES, sealHomeActions ? 'readwrite' : 'readonly');
       const store = transaction.objectStore(STORE_MESSAGES);
       const index = store.index('charId');
       const request = index.getAll(IDBKeyRange.only(charId));
+      let snapshot: Message[] = [];
       request.onsuccess = () => {
           let results = (request.result || []).filter((m: Message) => !m.groupId);
+          // A one-shot archive includes the tail. Freeze its home action segments
+          // in the same transaction as the snapshot, before any LLM/network wait.
+          if (sealHomeActions) for (const message of results) {
+              if (message.metadata?.source === 'home' && message.metadata?.homeContextKind === 'actions' && !message.metadata.homeContextSealed) {
+                  message.metadata = { ...message.metadata, homeContextSealed: true };
+                  store.put(message);
+              }
+          }
           // 记忆宫殿：过滤已处理的消息（高水位标记之前的），用向量记忆替代
           if (!includeProcessed) {
               try {
@@ -654,9 +713,12 @@ export const DB = {
                   }
               } catch {}
           }
-          resolve(results);
+          snapshot = results;
       };
       request.onerror = () => reject(request.error);
+      transaction.oncomplete = () => resolve(snapshot);
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error || new Error('聊天历史快照未能完成'));
     });
   },
 
@@ -997,8 +1059,9 @@ export const DB = {
     const db = await openDB();
     return new Promise((resolve, reject) => {
       const transaction = db.transaction(STORE_MESSAGES, 'readwrite');
+      deleteSecretNotesForIds(transaction.objectStore(STORE_MESSAGES), [id]);
       transaction.objectStore(STORE_MESSAGES).delete(id);
-      transaction.oncomplete = () => resolve();
+      transaction.oncomplete = () => {announceSecretNotesChanged(); resolve();};
       transaction.onerror = () => reject(transaction.error);
       transaction.onabort = () => reject(transaction.error || new Error('deleteMessage aborted'));
     });
@@ -1011,9 +1074,12 @@ export const DB = {
       const db = await openDB();
       const transaction = db.transaction(STORE_MESSAGES, 'readwrite');
       const store = transaction.objectStore(STORE_MESSAGES);
+      deleteSecretNotesForIds(store, ids);
       ids.forEach(id => store.delete(id));
-      return new Promise((resolve) => {
-          transaction.oncomplete = () => resolve();
+      return new Promise((resolve, reject) => {
+          transaction.oncomplete = () => {announceSecretNotesChanged(); resolve();};
+          transaction.onerror = () => reject(transaction.error);
+          transaction.onabort = () => reject(transaction.error || new Error('deleteMessages aborted'));
       });
   },
 
@@ -1038,7 +1104,7 @@ export const DB = {
         }
       };
       request.onerror = () => reject(request.error);
-      transaction.oncomplete = () => resolve();
+      transaction.oncomplete = () => {announceSecretNotesChanged(charId); resolve();};
       transaction.onerror = () => reject(transaction.error);
       transaction.onabort = () => reject(transaction.error || new Error('clearMessages aborted'));
     });
@@ -1859,8 +1925,22 @@ export const DB = {
 
   saveUserProfile: async (profile: UserProfile): Promise<void> => {
       const db = await openDB();
-      const transaction = db.transaction(STORE_USER, 'readwrite');
-      transaction.objectStore(STORE_USER).put({ ...profile, id: 'me' });
+      return new Promise((resolve,reject)=>{
+          const transaction=db.transaction(STORE_USER,'readwrite'),store=transaction.objectStore(STORE_USER),request=store.get('me');
+          request.onsuccess=()=>store.put({...profile,wardrobeOutfits:request.result?.wardrobeOutfits??profile.wardrobeOutfits,id:'me'});
+          transaction.oncomplete=()=>resolve();transaction.onerror=transaction.onabort=()=>reject(transaction.error);
+      });
+  },
+
+  /** Wardrobe is edited independently of profile forms; merge within one transaction. */
+  updateWardrobeOutfits: async (update:(items:NonNullable<UserProfile['wardrobeOutfits']>)=>NonNullable<UserProfile['wardrobeOutfits']>):Promise<NonNullable<UserProfile['wardrobeOutfits']>> => {
+      const db=await openDB();
+      return new Promise((resolve,reject)=>{
+          const tx=db.transaction(STORE_USER,'readwrite'),store=tx.objectStore(STORE_USER),request=store.get('me');
+          let items:NonNullable<UserProfile['wardrobeOutfits']>=[],failure:unknown;
+          request.onsuccess=()=>{try{const profile=request.result??{id:'me',name:'我',avatar:'',bio:''};items=update(profile.wardrobeOutfits??[]);store.put({...profile,wardrobeOutfits:items});}catch(e){failure=e;tx.abort();}};
+          tx.oncomplete=()=>resolve(items);tx.onerror=tx.onabort=()=>reject(failure??tx.error);
+      });
   },
 
   getUserProfile: async (): Promise<UserProfile | null> => {
@@ -3532,11 +3612,10 @@ export const DB = {
           getAllFromStore(STORE_LIFE_SETTINGS),
       ]);
 
-      const userProfile = userProfiles.length > 0 ? {
-          name: userProfiles[0].name,
-          avatar: userProfiles[0].avatar,
-          bio: userProfiles[0].bio
-      } : undefined;
+      // Personal backups retain the whole profile, including Chibi/3D slots.
+      // Sharing-card privacy filtering must not be applied to a device backup.
+      const userProfile = userProfiles.length > 0 ? { ...userProfiles[0] } : undefined;
+      if (userProfile) delete userProfile.id;
 
       const mainState = bankData.find((d: any) => d.id === 'main_state');
       const dollhouseRecord = bankData.find((d: any) => d.id === 'dollhouse_state');
@@ -3578,6 +3657,7 @@ export const DB = {
           worldHomeLocal: exportWorldHomeLocal(), // 家园本机配置：全局 API + 文风收藏（存 localStorage）
           luckinLocal: exportLuckinLocal(),       // 瑞幸 token + 启用状态（存 localStorage）
           mcdLocal: exportMcdLocal(),             // 麦当劳 token + 启用状态（存 localStorage）
+          home3DLocal: exportHome3DLocal(),
           mcpLocal: exportMcpLocal(),             // 通用 MCP 服务器配置（存 localStorage）
           amsg2GlobalConfig: await exportAmsg2GlobalConfig(options), // 主动消息 2.0 全局配置（存独立的 ActiveMsg 库；后端连接默认不带走）
           beautyAuthorLocal: exportBeautyAuthorBackup(),
@@ -3727,6 +3807,7 @@ export const DB = {
           data.worlds !== undefined,
           data.worldEpisodes !== undefined,
           (data as any).worldHomeLocal !== undefined,
+          data.home3DLocal !== undefined,
           (data as any).luckinLocal !== undefined,
           (data as any).mcdLocal !== undefined,
           data.pixelHomeAssets !== undefined,
@@ -4053,6 +4134,19 @@ export const DB = {
           importMcdLocal((data as any).mcdLocal); // token + 启用状态
           (data as any).mcdLocal = undefined;
       }, 1);
+      await runSection('3D 家园本机偏好', data.home3DLocal !== undefined, async () => {
+          importHome3DLocal(data.home3DLocal);
+          // Imported assets may contain an older localStorage mirror. Do not let
+          // the next startup resurrect preferences explicitly reset by this backup.
+          const mirror = await DB.getAssetRaw('ls_mirror_v1');
+          if (mirror?.data && typeof mirror.data === 'object' && !Array.isArray(mirror.data)) {
+              const values = {...mirror.data};
+              for (const key of HOME3D_LOCAL_KEYS) delete values[key];
+              await DB.saveAssetRaw('ls_mirror_v1', {...mirror, data: {...values, ...exportHome3DLocal()}});
+          }
+          data.home3DLocal = undefined;
+      });
+
       await runSection('MCP 服务器配置', (data as any).mcpLocal !== undefined, async () => {
           importMcpLocal((data as any).mcpLocal); // 用户自配的 MCP 服务器列表
           (data as any).mcpLocal = undefined;
